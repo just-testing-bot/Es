@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from telegram import Bot, InputSticker, StickerSet
 
@@ -60,7 +60,7 @@ async def duplicate_pack(
     new_owner_user_id: int,
     new_name_slug: str,
     new_title: str,
-) -> str:
+) -> Tuple[str, str]:
     original = await bot.get_sticker_set(name=target_pack_name)
     sticker_type = original.sticker_type
 
@@ -88,4 +88,4 @@ async def duplicate_pack(
         if idx % 10 == 0:
             await asyncio.sleep(0)
 
-    return new_name_slug
+    return new_name_slug, sticker_type

@@ -435,6 +435,20 @@ async def create_receive_first_item(update: Update, context: ContextTypes.DEFAUL
     pack_id = insert_pack(user_id, slug, title, pack_type, meta.get("is_paid", False), link)
 
     await update.message.reply_text(f"Pack created! {link}")
+
+    # Save first item to DB with best-effort file_id (may be bytes for uploads)
+    try:
+        file_id = None
+        if update.message.sticker:
+            file_id = update.message.sticker.file_id
+        elif update.message.photo:
+            file_id = update.message.photo[-1].file_id
+        else:
+            file_id = "GENERATED"
+        insert_pack_item(pack_id, file_id, None, pack_type)
+    except Exception:
+        pass
+
     pending_create.pop(user_id, None)
     return ConversationHandler.END
 
@@ -448,15 +462,13 @@ async def apack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.adaptive_pack_name:
         await update.message.reply_text("Adaptive pack already exists.")
         return
-    # charge stars simulated via invoice
-    title = "Adaptive Emoji Pack"
+    # charge stars via Stars invoice (provider token implicit for XTR)
     payload = f"apack:{user.user_id}:{int(time.time())}"
     await context.bot.send_invoice(
         chat_id=update.effective_chat.id,
         title="Adaptive Pack",
         description="Create an adaptive emoji pack",
         payload=payload,
-        provider_token="XTR",
         currency="XTR",
         prices=[LabeledPrice("Adaptive Pack", PRICE_APACK_XTR)],
         need_name=False,
@@ -545,7 +557,6 @@ async def acr_bg_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         png = render_text_emoji(state["text"], font_path=font_path, background_mode=state.get("bg", "none"))
         input_sticker = pil_image_bytes_to_input_sticker(png, ["😀"]) 
     elif state.get("mode") == "photo":
-        # Just re-use the file id as sticker input (scaled server-side)
         input_sticker = InputSticker(sticker=state["photo_file_id"], format="static", emoji_list=["😀"]) 
     elif state.get("mode") == "emoji":
         input_sticker = InputSticker(sticker=state["emoji_file_id"], format="static", emoji_list=["😀"]) 
@@ -695,7 +706,6 @@ async def duplicate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title="Duplicate Pack",
         description="Duplicate target pack into your account",
         payload=payload,
-        provider_token="XTR",
         currency="XTR",
         prices=[LabeledPrice("Duplicate", PRICE_DUPLICATE_XTR)],
     )
@@ -831,7 +841,6 @@ async def bpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title=f"Buy {kind} pack tier",
         description=f"Unlock paid {kind} packs",
         payload=payload,
-        provider_token="XTR",
         currency="XTR",
         prices=[LabeledPrice("Paid pack", price)],
     )
@@ -861,13 +870,26 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("Unauthorized.")
         return
+    # Prefer forwarding the replied message if present
+    if update.message.reply_to_message:
+        with db() as con:
+            cur = con.cursor()
+            cur.execute("SELECT user_id FROM users")
+            uids = [r[0] for r in cur.fetchall()]
+        sent = 0
+        for uid in uids:
+            try:
+                await update.message.reply_to_message.copy(chat_id=uid)
+                sent += 1
+            except Exception:
+                continue
+        await update.message.reply_text(f"Broadcast forwarded to {sent} users.")
+        return
+
     text = " ".join(context.args) if context.args else None
-    if not text and update.message.reply_to_message:
-        text = update.message.reply_to_message.text or ""
     if not text:
         await update.message.reply_text("Provide text or reply to a message.")
         return
-    # Iterate over all users
     with db() as con:
         cur = con.cursor()
         cur.execute("SELECT user_id FROM users")
@@ -897,7 +919,9 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 11. Payments handling (Stars invoices)
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.pre_checkout_query
-    await q.answer(ok=True)
+    # Accept only our payload patterns
+    ok = bool(re.match(r"^(bpack|apack|duplicate):", q.invoice_payload or ""))
+    await q.answer(ok=ok, error_message=None if ok else "Invalid invoice.")
 
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -923,12 +947,12 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         bot_username = (await context.bot.get_me()).username
         new_slug = normalize_pack_name(f"dup_{uid}_{int(time.time())}_by_{bot_username}")
         try:
-            new_name = await duplicate_pack(context.bot, target_name, uid, new_slug, f"Duplicate of {target_name}")
+            new_name, new_type = await duplicate_pack(context.bot, target_name, uid, new_slug, f"Duplicate of {target_name}")
         except Exception as e:
             await update.message.reply_text(f"Duplication failed: {e}")
             return
-        link = f"https://t.me/addstickers/{new_name}"
-        insert_pack(uid, new_name, f"Duplicate of {target_name}", "sticker", True, link)
+        link = f"https://t.me/{'addemoji' if new_type == 'custom_emoji' else 'addstickers'}/{new_name}"
+        insert_pack(uid, new_name, f"Duplicate of {target_name}", 'emoji' if new_type == 'custom_emoji' else 'sticker', True, link)
         await update.message.reply_text(f"Duplicated: {link}")
 
 
@@ -958,7 +982,7 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_private(update, context):
         return
     if not update.message.document:
-        await update.message.reply_text("Send a JSON backup file with /import.")
+        await update.message.reply_text("Please attach a JSON backup file to the /import command as a document.")
         return
     file = await update.message.document.get_file()
     content = await file.download_as_bytearray()
@@ -972,7 +996,6 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as con:
         cur = con.cursor()
         for p in packs:
-            # columns as in SELECT * order; be defensive
             try:
                 _, user_id, name, title, type_, is_paid_pack, link, _ = p
                 if user_id != update.effective_user.id:
