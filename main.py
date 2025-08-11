@@ -1029,6 +1029,58 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def mypack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_private(update, context):
+        return
+    uid = update.effective_user.id
+    packs = find_user_packs(uid)
+    if not packs:
+        await update.message.reply_text("You have no packs yet. Use /create to get started.")
+        return
+    buttons = [[InlineKeyboardButton(text=f"{title} ({'emoji' if t=='emoji' else 'sticker'})", callback_data=f"mypack|{pid}")]
+               for pid, name, title, t, p, link in packs[:20]]
+    await update.message.reply_text("Your packs:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def mypack_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, pid_s = q.data.split("|", 1)
+        pid = int(pid_s)
+    except Exception:
+        await q.edit_message_text("Invalid selection.")
+        return
+    p = get_pack_by_id(pid)
+    if not p or p[1] != q.from_user.id:
+        await q.edit_message_text("Pack not found.")
+        return
+    pack_id, owner_id, name, title, type_, is_paid_pack, link = p
+
+    # Try fetching live sticker set info
+    items_count = None
+    try:
+        ss = await context.bot.get_sticker_set(name=name)
+        items_count = getattr(ss, "sticker_count", None)
+    except Exception:
+        pass
+    if items_count is None:
+        items_count = count_pack_items(pack_id)
+
+    info_lines = [
+        f"Title: {title}",
+        f"Type: {'emoji' if type_=='emoji' else 'sticker'}",
+        f"Paid pack: {'yes' if is_paid_pack else 'no'}",
+        f"Items: {items_count}",
+        f"Link: {link}",
+        "Users using: not tracked",
+    ]
+    buttons = [
+        [InlineKeyboardButton(text="Open", url=link)],
+    ]
+    await q.edit_message_text("\n".join(info_lines), reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
+
+
 def build_app() -> Application:
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1036,6 +1088,7 @@ def build_app() -> Application:
     # Core commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("mypack", mypack_cmd))
 
     # Create conversation
     app.add_handler(ConversationHandler(
@@ -1066,6 +1119,7 @@ def build_app() -> Application:
     # Inline add to packs
     app.add_handler(MessageHandler((filters.Sticker.ALL | filters.PHOTO | filters.TEXT) & ~filters.COMMAND, incoming_item))
     app.add_handler(CallbackQueryHandler(addto_callback, pattern=r"^addto\|"))
+    app.add_handler(CallbackQueryHandler(mypack_select, pattern=r"^mypack\|"))
 
     # Duplicate
     app.add_handler(CommandHandler("duplicate", duplicate_cmd))
